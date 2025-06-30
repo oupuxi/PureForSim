@@ -1,4 +1,9 @@
+'''
+统一入口，加载配置、初始化日志，然后调用 simulator 完成模拟，再调用 visualize 展示结果。
+'''
 # ray_tracing_simulation.py
+# 调用 simulator.run() 启动仿真
+
 
 import numpy as np
 import open3d as o3d
