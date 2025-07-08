@@ -1,1 +1,0 @@
-# 初始化日志格式和级别，然后在各模块通过 import logging 获取 logger 使用。
