@@ -1,7 +1,4 @@
-import pytest
-
-
-from src.logger.logger import setup_logger
+from examples.logger import setup_logger
 
 logger = setup_logger(__name__)
 
