@@ -70,7 +70,6 @@ def calculate_friedlander_beta(charge_weight: float,
     return max(beta_final, beta_min)
 # td
 def calculate_friedlander_td(charge_weight: float,
-
                              prev_distance: float,
                              distance: float,
                              prev_td: float = None,
@@ -110,8 +109,8 @@ def calculate_friedlander_td(charge_weight: float,
 
 
 # 到达时间ta
-def calculate_friedlander_time_arrive(path: List[Tuple[float, float]],
-                                      charge_weight: float,
+def calculate_friedlander_time_arrive(charge_weight: float,
+                                      path: List[Tuple[float, float]],
                                       sound_speed: float = 343.0,
                                       speed_scale: float = 1.1) -> float:
     """
@@ -277,7 +276,7 @@ if __name__ == "__main__":
     Ps   = calculate_friedlander_peak_overpressure(charge_weight, path)   # kPa
     td   =  calculate_friedlander_td(charge_weight, 0, 50)              # ms
     beta = calculate_friedlander_beta(charge_weight, path)              # —
-    ta   = calculate_friedlander_time_arrive(path, charge_weight)       # ms
+    ta   = calculate_friedlander_time_arrive(charge_weight, path)       # ms
 
     print(f"Ps  = {Ps:.1f} kPa")
     print(f"td  = {td:.1f} ms")
