@@ -5,223 +5,286 @@ calculate_blast_parameters.py
 冲击波正相位持续时间、峰值超压等。
 """
 import math
+import warnings
 from typing import List, Tuple
-
+from typing import Optional
 import numpy as np
 from matplotlib import pyplot as plt
 from scipy.optimize import root_scalar
 
 from src.utils.Kingery import KingeryBulmashModel
+from src.data_struct.data_structs import RayPath, NodeType, WallNode, ProbeNode, SOUND_C, BaseNode
 
+
+def _calc_Cr(cos_theta: float) -> float:
+    """近似正入射反射系数"""
+    theta_deg = np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
+    if theta_deg < 60.0:
+        return 2.0 + cos_theta ** 2 + 3.0 * cos_theta
+    return 1.0
+def _cos_theta(prev_pt: np.ndarray, curr_pt: np.ndarray, normal: np.ndarray) -> float:
+    dir_in = (curr_pt - prev_pt)
+    dir_in /= (np.linalg.norm(dir_in) + 1e-12)
+    normal /= (np.linalg.norm(normal) + 1e-12)
+    return abs(dir_in @ normal)
+
+
+# ---------- 动态寻找括区的辅助函数 ----------
+def _find_bracket(f, x_lo=0.05, x_hi=1.0,
+                  factor=2.0, max_iter=20):
+    """
+    逐次把 x_hi *= factor，直到 f(x_lo)*f(x_hi)<0。
+    若始终同号，返回 None。
+    """
+    f_lo, f_hi = f(x_lo), f(x_hi)
+    for _ in range(max_iter):
+        if f_lo * f_hi < 0:          # 已异号
+            return (x_lo, x_hi)
+        x_hi *= factor               # 向右扩张
+        f_hi = f(x_hi)
+    return None                      # bracket 未找到
 
 # β
-def calculate_friedlander_beta(charge_weight: float,
-                               path: List[Tuple[float, float]],
+def calculate_friedlander_beta(raypath,
+                               charge_weight: float,
                                decay_factor: float = 0.85,
-                               beta_min: float = 0.25) -> float:
-    """根据路径获取 Friedlander 衰减系数 β。
-
-    * **自由场**: 当 ``path`` 仅含两个节点(爆心→自由场点)，
-      直接从 KB 表读取 ``Ps, td, I`` 数值反推 β (Brent 根求解)。
-    * **多段反射**: 首段自由场反推得到 β₀，随后每次反射 β 乘以
-      ``decay_factor``，并强制不低于 ``beta_min``。
-
-    参数
-    ------
-    charge_weight: 爆炸当量（kg TNT）。
-    path: 坐标序列 ``[(x0,y0), (x1,y1), ...]``。
-           - len==2 ⇒ 自由场  (β₀ 数值反推)
-           - len>2  ⇒ 多次反射 (β = β₀ × decay_factor^(n‑1))
-    decay_factor: 每次反射的 β 衰减系数(默认 0.85)。
-    beta_min:     β 最小值下限，避免过小(默认 0.25)。
-
-    返回
-    ------
-    float: 终点处 β (dimensionless)。
+                               beta_min: float = 0.25,
+                               beta_fallback: float = 0.30) :
     """
-    if len(path) < 2:
-        raise ValueError("路径至少应包含爆心与一个目标点")
+递推计算 RayPath 路径各节点的 Friedlander 衰减系数 β，并返回终点节点的 β。
 
-    # ── 首段自由场距离 ──
-    R_free = math.hypot(path[1][0] - path[0][0], path[1][1] - path[0][1])
+算法说明：
+    - 首段（爆心→首命中点，节点0→1）：
+        采用 Kingery-Bulmash 表，根据爆炸当量和距离数值反求获得自由场 β₀。
+    - 其后每次遇到障碍物（即每过一个节点）：
+        β 按固定衰减因子 decay_factor 递减（即 β = β₀ × decay_factor^n）。
+        最小不低于 beta_min。
+
+参数:
+    raypath      : RayPath 路径对象，nodes 为节点链表，节点.coord 为三维坐标
+    charge_weight: 炸药当量（kg TNT），用于 KB 查表
+    decay_factor : β 每经过一次反射的递减系数，默认 0.85
+    beta_min     : β 最小允许值，默认 0.25
+
+过程:
+    - 自动将各节点的 friedlander_beta 字段填入递推值（节点0、1为 β₀，其后依次衰减）
+
+返回:
+    float        : 路径最后一个节点的 Friedlander β 系数
+
+示例:
+    beta_end = calculate_friedlander_beta(path, charge_weight=10)
+
+"""
+    nodes = raypath.nodes
+    if len(nodes) < 2:
+        raise ValueError("路径节点数不足 2")
+    p0, p1 = map(np.asarray, (nodes[0].coord, nodes[1].coord))
+    R_free = np.linalg.norm(p1 - p0)
+
     kb = KingeryBulmashModel(neq=charge_weight, distance=R_free)
-    Ps_kpa = kb.incident_pressure       # kPa
-    td_ms  = kb.positive_phase_duration # ms
-    I_kpams = kb.incident_impulse       # kPa·ms
+    Ps_kpa = kb.incident_pressure
+    td_ms = kb.positive_phase_duration
+    I_kpams = kb.incident_impulse
 
-    # ---- 数值反推 β₀ ----
-    def residual(beta):
+    # ---------- 2. 构造残差函数 ----------
+    def residual(beta: float) -> float:
         if beta <= 0:
             return np.inf
-        return (Ps_kpa * td_ms / beta) * (1 - 1 / np.exp(beta)) - I_kpams
+        I_fried = (Ps_kpa * td_ms / beta) * (1 - np.exp(-beta))
+        return I_fried - I_kpams
 
-    sol = root_scalar(residual, bracket=(0.1, 5.0), method="brentq")
-    if not sol.converged:
-        raise RuntimeError("β 反求未收敛，请检查 KB 输入区间")
-    beta0 = sol.root
+    # ---------- 3. 动态括区 + 求根 ----------
+    bracket = _find_bracket(residual, x_lo=0.05, x_hi=1.0)
 
-    if len(path) == 2:
-        # 只有自由场
-        return beta0
-
-    # ---- 多段反射：按反射次数衰减 ----
-    reflection_count = len(path) - 2  # 后续段数 = 反射次数
-    beta_final = beta0 * (decay_factor ** reflection_count)
-    return max(beta_final, beta_min)
-# td
-def calculate_friedlander_td(charge_weight: float,
-                             prev_distance: float,
-                             distance: float,
-                             prev_td: float = None,
-                             is_free_field: bool = True,
-                             td_max: float = 200.0) -> float:
-    """
-    计算正相位持续时间 td（单位：ms）
-
-    参数:
-        charge_weight (float): 炸药当量（kg TNT），仅自由场时需要
-        prev_distance (float): 上一段传播距离（m）
-        distance (float): 当前传播距离（m）
-        prev_td (float): 上一段 td，仅反射传播时需要
-        is_free_field (bool): 是否为自由场，默认为 True
-
-    返回:
-        float: 当前传播位置的 td（正相位持续时间，单位ms）
-    """
-    if is_free_field:
-        if charge_weight is None:
-            raise ValueError("自由场计算必须提供 charge_weight")
-        if distance <= 0:
-            raise ValueError("distance 必须为正数")
-        model = KingeryBulmashModel(neq=charge_weight, distance=distance, unit_system='metric')
-        return model.positive_phase_duration
-
+    if bracket is None:  # 始终同号 ⇒ 用后备值
+        warnings.warn("β root 未括住，使用 fallback", RuntimeWarning)
+        beta0 = beta_fallback
     else:
-        if prev_td is None or prev_distance is None or distance is  None:
-            raise ValueError("反射传播计算 td 需要提供 prev_td 和 prev_distance和distance")
-        if prev_distance <= 0 or distance <= 0:
-            raise ValueError("传播距离必须为正数")
+        sol = root_scalar(residual, bracket=bracket, method="brentq")
+        if not sol.converged:
+            warnings.warn("β 反求未收敛，使用 fallback", RuntimeWarning)
+            beta0 = beta_fallback
+        else:
+            beta0 = sol.root
 
-        ratio = distance / prev_distance
+    # ---------- 4. 写 β 到各节点 ----------
+    nodes[1].friedlander_beta = beta0  # 自由场节点
+    for i in range(2, len(nodes)):
+        beta_i = max(beta0 * decay_factor ** (i - 1), beta_min)
+        nodes[i].friedlander_beta = beta_i
+
+    return nodes[-1].friedlander_beta
+# td
+def calculate_friedlander_td(raypath: RayPath,
+                             charge_weight: float,
+                             td_max: float = 200.0) :
+    """
+    给 RayPath 所有节点递推填充正相位持续时间 td (ms) 到节点字段 constant_time_ms。
+    - 节点1（自由场终点）用 KB 查表；
+    - 后续节点用前一段的 td 和距离，递推。
+    """
+    nodes = raypath.nodes
+    if len(nodes) < 2:
+        raise ValueError("路径节点数不足2")
+    # 节点0为爆心，无意义（可设为0或None）
+    nodes[0].constant_time_ms = 0.0
+
+    # 节点1（自由场终点）
+    p0 = np.array(nodes[0].coord)
+    p1 = np.array(nodes[1].coord)
+    dist1 = np.linalg.norm(p1 - p0)
+    model = KingeryBulmashModel(neq=charge_weight, distance=dist1)
+    td1 = model.positive_phase_duration
+    nodes[1].constant_time_ms = td1
+
+    # 后续节点递推
+    for i in range(2, len(nodes)):
+        pa = np.array(nodes[i - 1].coord)
+        pb = np.array(nodes[i].coord)
+        prev_td = nodes[i - 1].constant_time_ms
+        prev_distance = np.linalg.norm(pa - np.array(nodes[i - 2].coord))
+        distance = np.linalg.norm(pb - pa)
+        # 递推公式（与你的 calculate_friedlander_td 保持一致）
+        ratio = distance / prev_distance if prev_distance > 0 else 1.0
         td = prev_td * math.log1p(ratio)
-        return min(td, td_max)
+        td = min(td, td_max)
+        nodes[i].constant_time_ms = td
 
 
 
 # 到达时间ta
-def calculate_friedlander_time_arrive(charge_weight: float,
-                                      path: List[Tuple[float, float]],
-                                      sound_speed: float = 343.0,
-                                      speed_scale: float = 1.1) -> float:
+def calculate_friedlander_time_arrive(
+        raypath: RayPath,
+        charge_weight: float,
+        sound_speed: float = 343.0,
+        speed_scale: float = 1.1
+) :
     """
-    计算 Friedlander 模型的冲击波到达时间（单位：ms）
+    递推计算 RayPath 路径中每个节点的冲击波到达时间（ms），并自动填入各节点的 arrive_time_ms 字段。
+
+    算法说明:
+        - 首段（爆心 → 第1个命中点）：查 Kingery-Bulmash 表获取自由场传播时延（ms）。
+        - 其余段（多次反射/障碍物/探测面）：按速度 v = sound_speed × speed_scale（默认1.1倍声速）递推累加，delta_t = 段长 / v。
+        - 到达时间按节点顺序递推，所有节点的 arrive_time_ms 字段被依次写入。
 
     参数:
-        path (List[Tuple[float, float]]): 坐标路径，起点为爆炸点，第一个点为自由场终点
-        charge_weight (float): 炸药当量（kg TNT），用于查询 KB 表
-        sound_speed (float): 基础声速（m/s），默认 343
-        speed_scale (float): 超声速系数，默认 1.1 倍声速
+        raypath      : RayPath 对象，包含节点链表 nodes（每个节点需有 coord 字段，三维坐标）
+        charge_weight: 炸药当量（kg TNT），用于 KB 表查自由场传播时间
+        sound_speed  : 空气中声速（m/s），默认 343
+        speed_scale  : 障碍物段的超声速比例系数（默认 1.1）
+
+    过程:
+        - 自动将各节点的 arrive_time_ms 字段填入递推值（节点0为0，节点1查KB，节点2及以后用公式递推）
 
     返回:
-        float: 总到达时间（单位 ms）
+        无返回值（到达时间直接填入每个节点的 arrive_time_ms 字段）
+
+    用法示例:
+        calculate_friedlander_time_arrive(path, charge_weight=10)
+        for n in path.nodes:
+            print(n.arrive_time_ms)
+
     """
 
-    if len(path) < 2:
-        raise ValueError("路径必须至少包含两个点")
-
-    # --- 自由场段 ---
-    x0, y0 = path[0]
-    x1, y1 = path[1]
-    dist0 = math.hypot(x1 - x0, y1 - y0)
-
+    nodes = raypath.nodes
+    if len(nodes) < 2:
+        raise ValueError("路径节点数不足2")
+    # 节点0（爆源）设为0
+    nodes[0].arrive_time_ms = 0.0
+    # 节点1（第一个命中点）：查 KB 得到 t0
+    p0 = np.array(nodes[0].coord)
+    p1 = np.array(nodes[1].coord)
+    dist0 = np.linalg.norm(p1 - p0)
     try:
         model = KingeryBulmashModel(neq=charge_weight, distance=dist0)
-        t0_ms = model.time_of_arrival  # 单位 ms
+        t0_ms = model.time_of_arrival
     except Exception as e:
-        raise RuntimeError(f"KB 表查找失败：{e}")
+        raise RuntimeError(f"KB表查找失败：{e}")
+    nodes[1].arrive_time_ms = t0_ms
 
-    # --- 反射段 ---
-    t_extra_ms = 0.0
-    v = sound_speed * speed_scale  # m/s
-
-    for i in range(1, len(path) - 1):
-        xa, ya = path[i]
-        xb, yb = path[i + 1]
-        segment_dist = math.hypot(xb - xa, yb - ya)
-        t_extra_ms += (segment_dist / v) * 1000  # s → ms
-
-    return t0_ms + t_extra_ms
+    # 其余节点递推
+    v = sound_speed * speed_scale
+    for i in range(2, len(nodes)):
+        pa = np.array(nodes[i - 1].coord)
+        pb = np.array(nodes[i].coord)
+        segment_dist = np.linalg.norm(pb - pa)
+        delta_t_ms = (segment_dist / v) * 1000
+        nodes[i].arrive_time_ms = nodes[i - 1].arrive_time_ms + delta_t_ms
 # Ps
-def calculate_friedlander_peak_overpressure(charge_weight: float,
-                                            path: List[Tuple[float, float]],
-                                            decay_exponent: float = 1.5,
-                                            wall_reflect_factor: float = 1.0) -> float:
-    """根据多段路径计算峰值超压 Ps（单位：kPa）。
-
-    思路说明
-    --------
-    1. **第一段（爆心 → 第一反射点）**
-       - 直接调用 Kingery‑Bulmash 表，获取 "反射峰压" `Ps0`。
-    2. **后续每一段（反射传播）**
-       - 用距离比例衰减公式：
-         ``Ps_next = Ps_prev × (R_prev / R_curr) ** n``
-       - 同时乘以一次墙面反射能量保持系数 ``wall_reflect_factor``。
-       - 其中 ``n = decay_exponent``，经验取 1.3–1.8。
-    3. **循环衰减到终点**，最终得到末端峰压。
-
-    参数
-    ------
-    charge_weight: 爆炸当量（kg TNT）。
-    path: 传播节点坐标序列 ``[(x0,y0), (x1,y1), ...]``。
-          - `path[0]` 为爆心；
-          - `path[1]` 为第一次反射点；
-          - 其余为连续反射后的传播节点，按顺序排列。
-    decay_exponent: 距离衰减指数 *n*，默认为 1.5。
-    wall_reflect_factor: 每次反射的墙面衰减系数，默认 1.0 表示无能量损失。
-
-    返回
-    ------
-    float: 终点处峰值超压（kPa）。
+def calculate_friedlander_peak_overpressure(
+        raypath: RayPath,
+        charge_weight: float,
+        *,
+        decay_exponent: float = 1.1,
+        alpha: float = 0.0                            # 可选线性吸收系数
+) -> float:
     """
-    # 路径至少包含爆心和一个目标点
-    if len(path) < 2:
-        raise ValueError("路径必须至少包含两个点（爆心 + 目标）")
+    为 RayPath 中的每个 Wall / Probe 节点写入
+        • incident_peak_pressure_kpa
+        • reflected_peak_pressure_kpa   (Probe 节点置 0)
+    并返回终点(Probe 或最后墙)的 incident_peak_pressure_kpa。
 
-    # ── 第 1 段：爆心 → 第 1 个反射点 ─────────────────────────────────────────
-    R_prev = math.hypot(path[1][0] - path[0][0], path[1][1] - path[0][1])
+    规则
+    ----
+    - 第一面：直接查 KB 表入射峰压 → 依 Cr 求反射峰压
+    - 后续段：以上一面“反射峰压”为起点，按 (R_prev/R_now)^n·e^{-αΔR} 衰减到入射峰压
+              再乘 Cr 得新的反射峰压
+    """
+    """
+        为 RayPath 写 incident / reflected 峰压 (kPa)，返回终点 incident 值。
+        - 传播使用上一面 *入射* 峰压
+        - 墙面反射仅影响当前节点，不影响后续
+        """
+    nodes = raypath.nodes
+    if len(nodes) < 2:
+        raise ValueError("RayPath 至少需 1 个 WALL/PROBE 节点")
 
-    # 查询 Kingery‑Bulmash 表，获取首段反射峰压 Ps0（单位 kPa）
-    kb_model = KingeryBulmashModel(neq=charge_weight, distance=R_prev)
-    Ps = kb_model.reflected_pressure
+    # ---------- 第一面 ----------
+    A, B = np.asarray(nodes[0].coord), np.asarray(nodes[1].coord)
+    R_prev = np.linalg.norm(B - A)
+    kb = KingeryBulmashModel(neq=charge_weight, distance=R_prev)
+    P_inc = float(kb.incident_pressure)
 
-    # 若仅有两点，表示无反射段，直接返回入射峰压或反射峰压
-    if len(path) == 2:
-        return Ps
+    # 第一面反射
+    normal1 = getattr(nodes[1], "normal", None)
+    if normal1 is not None:
+        cos_th = _cos_theta(A, B, np.asarray(normal1))
+    else:
+        cos_th = 1.0
+    C_r = _calc_Cr(cos_th)
+    nodes[1].incident_peak_pressure_kpa = P_inc
+    nodes[1].reflected_peak_pressure_kpa = P_inc * C_r
 
-    # ── 后续段：逐段衰减 ────────────────────────────────────────────────────
-    cumulative_dist = R_prev  # 已传播的累计距离
-
-    # 从第二段开始遍历：path[i] → path[i+1]
-    for i in range(1, len(path) - 1):
-        seg_dist = math.hypot(path[i + 1][0] - path[i][0],
-                              path[i + 1][1] - path[i][1])
-        if seg_dist <= 0:
-            # 跳过重合节点
+    # ---------- 后续面逐段传播 ----------
+    for idx in range(1, len(nodes) - 1):
+        prev_pt = np.asarray(nodes[idx].coord)
+        curr_pt = np.asarray(nodes[idx + 1].coord)
+        seg = np.linalg.norm(curr_pt - prev_pt)
+        if seg <= 0:
             continue
+        R_now = R_prev + seg
+        # 只用入射峰压递推
+        P_inc *= (R_prev / R_now) ** decay_exponent * np.exp(-alpha * seg)
 
-        cumulative_next = cumulative_dist + seg_dist  # 最新累计距离 R_curr
+        node = nodes[idx + 1]
+        node.incident_peak_pressure_kpa = P_inc
 
-        # 距离比例衰减
-        ratio = cumulative_dist / cumulative_next  # R_prev / R_curr
-        Ps *= ratio ** decay_exponent
+        if node.node_type is NodeType.WALL:
+            nrm = getattr(node, "normal", None)
+            if nrm is not None:
+                cos_th = _cos_theta(prev_pt, curr_pt, np.asarray(nrm))
+            else:
+                cos_th = 1.0
+            C_r = _calc_Cr(cos_th)
+            node.reflected_peak_pressure_kpa = P_inc * C_r
+        else:  # Probe
+            node.reflected_peak_pressure_kpa = 0.0
 
-        # 墙面能量保持衰减
-        Ps *= wall_reflect_factor
+        R_prev = R_now
 
-        # 更新累计距离，进入下一循环
-        cumulative_dist = cumulative_next
+    return nodes[-1].incident_peak_pressure_kpa
 
-    return Ps
 def generate_friedlander_pressure_time(
         Ps_kpa: float,
         td_ms: float,
@@ -262,32 +325,87 @@ def generate_friedlander_pressure_time(
 
     return t, P
 
+def compute_physics_for_raypath(raypath, charge_weight, sound_speed=343.0):
+    calculate_friedlander_beta(raypath, charge_weight)
+    calculate_friedlander_td(raypath, charge_weight)
+    calculate_friedlander_peak_overpressure(raypath, charge_weight)
+    calculate_friedlander_impulse(raypath)
+    calculate_friedlander_time_arrive(raypath, charge_weight, sound_speed=sound_speed)
+
+
+def friedlander_impulse(Ps: float, td: float, beta: float) -> float:
+    """Friedlander 波形的正相位冲量（kPa·ms）"""
+    if Ps <= 0 or td <= 0 or beta <= 0:
+        return 0.0
+    return Ps * td / beta * (1 - np.exp(-beta) * (1 + beta))
+
+def calculate_friedlander_impulse(raypath: RayPath) -> None:
+    """
+    自动为每个节点写入 incident_impulse、reflected_impulse (kPa·ms)。
+    依赖节点已写入 incident_peak_pressure_kpa, constant_time_ms, friedlander_beta。
+    """
+    nodes = raypath.nodes
+    for node in nodes:
+        # 入射冲量
+        Ps = getattr(node, "incident_peak_pressure_kpa", 0.0)
+        td = getattr(node, "constant_time_ms", 0.0)
+        beta = getattr(node, "friedlander_beta", 0.0)
+        node.incident_impulse = friedlander_impulse(Ps, td, beta)
+        # 反射冲量
+        if node.node_type is NodeType.WALL:
+            Ps_ref = getattr(node, "reflected_peak_pressure_kpa", 0.0)
+            node.reflected_impulse = friedlander_impulse(Ps_ref, td, beta)
+        else:
+            node.reflected_impulse = 0.0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 示例运行（仅当作为脚本执行时）
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    """示例：生成 50kg TNT、50m 自由场的 Friedlander 波形并绘图"""
+    def make_simple_raypath(points):
+        """从点序列生成一个简单的 RayPath（无物理反射，只直线）"""
+        raypath = RayPath(rid=0)
+        prev_node = None
+        for i, p in enumerate(points):
+            if i == 0:
+                node = BaseNode(node_id=0, coord=tuple(p), node_type=NodeType.SOURCE)
+            else:
+                node = BaseNode(node_id=i, coord=tuple(p), node_type=NodeType.WALL)
+            node.prev = prev_node
+            if prev_node:
+                prev_node.next = node
+            raypath.nodes.append(node)
+            prev_node = node
+        return raypath
+    """示例：生成 50kg TNT、50m 自由场的 Friedlander 波形并绘图（RayPath风格）"""
+    # 1) 构造简单 RayPath（爆心→50m）
+    charge_weight = 50
+    points = [(0, 0, 0), (50, 0, 0)]  # 爆心和目标点
+    raypath = make_simple_raypath(points)
 
-    # 1) 基本输入
-    charge_weight = 50               # kg TNT
-    path = [(0, 0), (50, 0)]         # 爆心 → 50m（自由场）
+    # 2) 各节点递推物理参数
+    calculate_friedlander_beta(raypath, charge_weight)
+    calculate_friedlander_td(raypath, charge_weight)
+    calculate_friedlander_time_arrive(raypath, charge_weight)
+    calculate_friedlander_peak_overpressure(raypath, charge_weight)
 
-    # 2) 关键参数
-    Ps   = calculate_friedlander_peak_overpressure(charge_weight, path)   # kPa
-    td   =  calculate_friedlander_td(charge_weight, 0, 50)              # ms
-    beta = calculate_friedlander_beta(charge_weight, path)              # —
-    ta   = calculate_friedlander_time_arrive(charge_weight, path)       # ms
+    # 3) 取末端节点（目标点）各物理参数
+    node = raypath.nodes[-1]
+    Ps = node.incident_peak_pressure_kpa
+    td = node.constant_time_ms
+    beta = node.friedlander_beta
+    ta = node.arrive_time_ms
 
     print(f"Ps  = {Ps:.1f} kPa")
     print(f"td  = {td:.1f} ms")
     print(f"β   = {beta:.3f}")
     print(f"ta  = {ta:.1f} ms")
 
-    # 3) Friedlander 波形
+    # 4) Friedlander 波形
     t, P = generate_friedlander_pressure_time(Ps, td, beta, ta_ms=ta, dt_ms=0.2)
 
-    # 4) 绘图
-    import matplotlib.pyplot as plt
+    # 5) 绘图
     plt.figure(figsize=(6, 3.5))
     plt.plot(t, P)
     plt.title("Friedlander Pressure History 50 kg TNT, 50 m (free field)")
