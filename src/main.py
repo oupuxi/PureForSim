@@ -130,7 +130,7 @@ def build_scene():
     vis_meshes.append(probe_mesh)
     probe_geom_ids.add(geom_id)
 
-    return scene,vis_meshes,material_map,probe_geom_ids
+    return scene,vis_meshes,material_map,probe_geom_ids,probe_grid
 
 
 
@@ -315,8 +315,140 @@ def raypath_to_lineset(raypath: RayPath, color=(1, 0, 0)):
     line_set.colors = o3d.utility.Vector3dVector(colors)
     return line_set
 
+def register_probe_hits_for_path(path: RayPath, grid: ProbeGrid) -> int:
+    """
+    遍历 RayPath，找到所有 ProbeNode，落格登记到 grid.cells。
+    返回登记条数（命中次数）。
+    """
+    count = 0
+    for node in path.nodes:
+        if isinstance(node, ProbeNode):
+            idx = grid.coord_to_index(node.coord)
+            if idx is not None:
+                grid.add_probe_node(idx, node)
+                count += 1
+    return count
+
+def make_probe_grid_lineset(grid: ProbeGrid) -> o3d.geometry.LineSet:
+    """生成探测面的网格线 LineSet（便于可视化对齐格子）"""
+    O = np.asarray(grid.origin, float)
+    U = np.asarray(grid.u_vec, float)
+    V = np.asarray(grid.v_vec, float)
+    # 顶点：按行列生成网格交点
+    verts = []
+    for j in range(grid.nv + 1):
+        for i in range(grid.nu + 1):
+            p = O + U * (i * grid.du) + V * (j * grid.dv)
+            verts.append(p)
+    verts = np.asarray(verts, float)
+
+    # 连线：横线 + 竖线
+    lines = []
+    # 横线 (沿 u 方向)
+    for j in range(grid.nv + 1):
+        row_start = j * (grid.nu + 1)
+        for i in range(grid.nu):
+            a = row_start + i
+            b = row_start + i + 1
+            lines.append([a, b])
+    # 竖线 (沿 v 方向)
+    for i in range(grid.nu + 1):
+        for j in range(grid.nv):
+            a = j * (grid.nu + 1) + i
+            b = (j + 1) * (grid.nu + 1) + i
+            lines.append([a, b])
+
+    ls = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(verts),
+        lines=o3d.utility.Vector2iVector(np.asarray(lines, int))
+    )
+    # 网格线颜色（淡青）
+    ls.colors = o3d.utility.Vector3dVector([[0.2, 0.8, 0.8]] * len(lines))
+    return ls
+
+def make_probe_hits_pointcloud(grid: ProbeGrid,
+                               color_by: str = "incident_peak_pressure_kpa",
+                               vmax: float | None = None) -> o3d.geometry.PointCloud:
+    """
+    将所有 Probe 命中点渲染为点云；按指定字段映射颜色（默认按入射峰压）。
+    颜色映射：红(高)→蓝(低)
+    """
+    pts, cols = [], []
+    # 收集所有命中
+    for hits in grid.cells.values():
+        for node in hits:
+            pts.append(np.asarray(node.coord, float))
+            val = float(getattr(node, color_by, 0.0))
+            cols.append(val)
+    if not pts:
+        return o3d.geometry.PointCloud()
+
+    pts = np.asarray(pts, float)
+    cols = np.asarray(cols, float)
+    if vmax is None:
+        vmax = max(cols.max(), 1e-6)
+    x = np.clip(cols / vmax, 0.0, 1.0)
+    # 简单红蓝配色：x=1→红, x=0→蓝
+    colors = np.stack([x, 0.0 * x, 1.0 - x], axis=1)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+    return pcd
+
+import csv
+
+def export_probe_hits_csv(grid: ProbeGrid, path: str) -> None:
+    """
+    把所有 Probe 命中点逐条导出（行=一次命中）。
+    列包含：i,j, x,y,z, Ps_inc, Ps_ref, I_inc, I_ref, ta, td, beta
+    """
+    fields = [
+        "i","j","x","y","z",
+        "incident_peak_pressure_kpa",
+        "reflected_peak_pressure_kpa",
+        "incident_impulse",
+        "reflected_impulse",
+        "arrive_time_ms",
+        "constant_time_ms",
+        "friedlander_beta",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        for (i,j), hits in grid.cells.items():
+            for n in hits:
+                x,y,z = n.coord
+                row = [
+                    i, j, x, y, z,
+                    getattr(n, "incident_peak_pressure_kpa", 0.0),
+                    getattr(n, "reflected_peak_pressure_kpa", 0.0),
+                    getattr(n, "incident_impulse", 0.0),
+                    getattr(n, "reflected_impulse", 0.0),
+                    getattr(n, "arrive_time_ms", 0.0),
+                    getattr(n, "constant_time_ms", 0.0),
+                    getattr(n, "friedlander_beta", 0.0),
+                ]
+                w.writerow(row)
+
+def export_probe_cell_stats_csv(grid: ProbeGrid, path: str) -> None:
+    """
+    对每个格子做简单聚合：命中次数、Pmax、最早到达时间。
+    """
+    import csv
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["i","j","hits","Pmax_inc_kPa","t_first_ms"])
+        for (i,j), hits in grid.cells.items():
+            if not hits:
+                continue
+            pmax = max(getattr(h, "incident_peak_pressure_kpa", 0.0) for h in hits)
+            tmin = min(getattr(h, "arrive_time_ms", float("inf")) for h in hits)
+            w.writerow([i, j, len(hits), pmax, tmin])
+
+
 if __name__ == "__main__":
-    scene, vis_meshes,material_map,probe_geom_ids= build_scene()
+    scene, vis_meshes,material_map,probe_geom_ids,probe_grid= build_scene()
     #----发射射线、追踪每条射线生成射线数个RayPath
     ray_dir = np.array([0.9, 0.8, 1.5])
     ray_dir = ray_dir / np.linalg.norm(ray_dir)
@@ -341,17 +473,33 @@ if __name__ == "__main__":
             value = getattr(n, field)
             print(f"  {field}: {value}")
 
+    # 把 Probe 命中登记进网格
+    num_hits = register_probe_hits_for_path(path, probe_grid)
+    print(f"\n登记到探测网格的命中次数: {num_hits}")
+    # 5) 打印每个被命中的格子
+    for (i, j), hits in probe_grid.cells.items():
+        print(f"cell({i},{j}): hits={len(hits)}  "
+              f"Pmax={max(getattr(h, 'incident_peak_pressure_kpa', 0.0) for h in hits):.1f} kPa  "
+              f"t_first={min(getattr(h, 'arrive_time_ms', 1e9) for h in hits):.2f} ms")
     # 由结点的参数，进行面的渲染
 
     # 渲染成 Open3D LineSet（红色）
     lineset = raypath_to_lineset(path, color=(1, 0, 0))
     vis_meshes.append(lineset)
+
+    vis_meshes.append(make_probe_grid_lineset(probe_grid))
+    pcd_hits = make_probe_hits_pointcloud(probe_grid, color_by="incident_peak_pressure_kpa")
+    if len(pcd_hits.points) > 0:
+        vis_meshes.append(pcd_hits)
     # 添加入场景的坐标系（长 10 米）
     axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=10.0, origin=(0.0,0.0,0.0))# 红色 X 轴，蓝色 Z 轴，绿色 Y 轴
     vis_meshes.append(axes)
 
 
-    #o3d.visualization.draw_geometries(vis_meshes)
+    # o3d.visualization.draw_geometries(vis_meshes)
+    export_probe_hits_csv(probe_grid, "probe_hits_points.csv")
+    export_probe_cell_stats_csv(probe_grid, "probe_hits_cells.csv")
+    print("\n已导出: probe_hits_points.csv / probe_hits_cells.csv")
     pass
 
 """

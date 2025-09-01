@@ -110,6 +110,18 @@ class ProbeGrid:
     def add_probe_node(self, idx: Tuple[int, int], node: ProbeNode):
         self.cells.setdefault(idx, []).append(node)
 
+    # (i,j) 单元索引得到格子的世界坐标中心点
+    def index_to_center(self, i: int, j: int) -> Tuple[float, float, float]:
+        """
+
+        """
+        if not (0 <= i < self.nu and 0 <= j < self.nv):
+            raise IndexError(f"ProbeGrid index out of range: {(i, j)}")
+        base = np.asarray(self.origin, dtype=np.float64)
+        u = np.asarray(self.u_vec, dtype=np.float64) * (i + 0.5) * self.du
+        v = np.asarray(self.v_vec, dtype=np.float64) * (j + 0.5) * self.dv
+        return tuple(base + u + v)
+
 # @dataclass
 # class BlastScene:
 #     """
