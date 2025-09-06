@@ -446,61 +446,131 @@ def export_probe_cell_stats_csv(grid: ProbeGrid, path: str) -> None:
             tmin = min(getattr(h, "arrive_time_ms", float("inf")) for h in hits)
             w.writerow([i, j, len(hits), pmax, tmin])
 
-
 if __name__ == "__main__":
-    scene, vis_meshes,material_map,probe_geom_ids,probe_grid= build_scene()
-    #----发射射线、追踪每条射线生成射线数个RayPath
-    ray_dir = np.array([0.9, 0.8, 1.5])
-    ray_dir = ray_dir / np.linalg.norm(ray_dir)
-    path = trace_single_ray(
-        scene=scene,
-        origin=(0.0, 0.01, 0.0),
-        dir=ray_dir,
-        material_map=material_map,
-        probe_geom_ids=probe_geom_ids,
-        max_bounces=3
-    )
-    print("节点数:", len(path.nodes))
-    for i, n in enumerate(path.nodes):
-        print(f"节点{i} ({n.node_type.name}): 坐标 = {n.coord}")
-    # 由路径进行冲击波量的计算
-    compute_physics_for_raypath(path,500)
+    scene, vis_meshes, material_map, probe_geom_ids, probe_grid = build_scene()
 
-    print("\n【所有节点参数快照】")
-    for i, n in enumerate(path.nodes):
-        print(f"\n节点{i} ({n.node_type.name}):")
-        for field in n.__dataclass_fields__:
-            value = getattr(n, field)
-            print(f"  {field}: {value}")
+    origin = (0.0, 0.01, 0.0)
 
-    # 把 Probe 命中登记进网格
-    num_hits = register_probe_hits_for_path(path, probe_grid)
-    print(f"\n登记到探测网格的命中次数: {num_hits}")
-    # 5) 打印每个被命中的格子
+    # ───────────────────────────────────────
+    # 7 条测试方向：
+    # 3 条打到同一格 (i=4, j=4)；4 条打到左右下上的邻格
+    # ───────────────────────────────────────
+    d_same_1 = np.array([0.797, 0.598,  0.0797])   # 命中 (4,4)
+    d_same_2 = np.array([0.815, 0.570,  0.1085])   # 命中 (4,4)
+    d_same_3 = np.array([0.774, 0.632,  0.0258])   # 命中 (4,4)
+
+    d_left   = np.array([0.797, 0.598, -0.0797])   # 命中 (3,4)
+    d_right  = np.array([0.778, 0.583,  0.2330])   # 命中 (5,4)
+    d_down   = np.array([0.861, 0.502,  0.0860])   # 命中 (4,3)
+    d_up     = np.array([0.735, 0.674,  0.0736])   # 命中 (4,5)
+
+    test_dirs = [d_same_1, d_same_2, d_same_3, d_left, d_right, d_down, d_up]
+
+    # 逐条发射、计算物理量、登记到 ProbeGrid
+    for k, d in enumerate(test_dirs, 1):
+        print(f"\n=== 发射射线 #{k} ===")
+        path = trace_single_ray(
+            scene=scene,
+            origin=origin,
+            dir=d,                         # 直接使用上面的单位方向
+            material_map=material_map,
+            probe_geom_ids=probe_geom_ids,
+            max_bounces=3
+        )
+        # 计算该条射线上的 Ps/td/β/ta/冲量等
+        compute_physics_for_raypath(path, 500)
+
+        # 登记到探测网格
+        hit_count = register_probe_hits_for_path(path, probe_grid)
+        print(f"登记命中次数: {hit_count}")
+
+        # 打印该条射线的 Probe 命中，以及各命中格子的 (i,j)
+        for n in path.nodes:
+            if isinstance(n, ProbeNode):
+                idx = probe_grid.coord_to_index(n.coord)
+                print(f"  Probe 命中坐标 {n.coord} → cell{idx}  "
+                      f"Ps={getattr(n,'incident_peak_pressure_kpa',0.0):.1f} kPa, "
+                      f"ta={getattr(n,'arrive_time_ms',0.0):.2f} ms")
+
+        # 可选：把单条路径的折线也加到可视化里
+        vis_meshes.append(raypath_to_lineset(path, color=(1, 0, 0)))
+
+    # 汇总打印每个被命中的格子的统计
+    print("\n【探测网格命中汇总】")
     for (i, j), hits in probe_grid.cells.items():
-        print(f"cell({i},{j}): hits={len(hits)}  "
-              f"Pmax={max(getattr(h, 'incident_peak_pressure_kpa', 0.0) for h in hits):.1f} kPa  "
-              f"t_first={min(getattr(h, 'arrive_time_ms', 1e9) for h in hits):.2f} ms")
-    # 由结点的参数，进行面的渲染
+        pmax = max(getattr(h, "incident_peak_pressure_kpa", 0.0) for h in hits)
+        tmin = min(getattr(h, "arrive_time_ms", 1e9) for h in hits)
+        print(f"  cell({i},{j}): hits={len(hits)}  Pmax={pmax:.1f} kPa  t_first={tmin:.2f} ms")
 
-    # 渲染成 Open3D LineSet（红色）
-    lineset = raypath_to_lineset(path, color=(1, 0, 0))
-    vis_meshes.append(lineset)
-
+    # 可视化：网格线 + 命中点云（按入射峰压着色）
     vis_meshes.append(make_probe_grid_lineset(probe_grid))
     pcd_hits = make_probe_hits_pointcloud(probe_grid, color_by="incident_peak_pressure_kpa")
     if len(pcd_hits.points) > 0:
         vis_meshes.append(pcd_hits)
-    # 添加入场景的坐标系（长 10 米）
-    axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=10.0, origin=(0.0,0.0,0.0))# 红色 X 轴，蓝色 Z 轴，绿色 Y 轴
+    axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=10.0, origin=(0,0,0))
     vis_meshes.append(axes)
+    o3d.visualization.draw_geometries(vis_meshes)
 
-
-    # o3d.visualization.draw_geometries(vis_meshes)
+    # 导出 CSV
     export_probe_hits_csv(probe_grid, "probe_hits_points.csv")
     export_probe_cell_stats_csv(probe_grid, "probe_hits_cells.csv")
     print("\n已导出: probe_hits_points.csv / probe_hits_cells.csv")
-    pass
+
+# if __name__ == "__main__":
+#     scene, vis_meshes,material_map,probe_geom_ids,probe_grid= build_scene()
+#     #----发射射线、追踪每条射线生成射线数个RayPath
+#
+#     ray_dir = np.array([0.9, 0.8, 1.5])
+#     ray_dir = ray_dir / np.linalg.norm(ray_dir)
+#     path = trace_single_ray(
+#         scene=scene,
+#         origin=(0.0, 0.01, 0.0),
+#         dir=ray_dir,
+#         material_map=material_map,
+#         probe_geom_ids=probe_geom_ids,
+#         max_bounces=3
+#     )
+#     print("节点数:", len(path.nodes))
+#     for i, n in enumerate(path.nodes):
+#         print(f"节点{i} ({n.node_type.name}): 坐标 = {n.coord}")
+#     # 由路径进行冲击波量的计算
+#     compute_physics_for_raypath(path,500)
+#
+#     print("\n【所有节点参数快照】")
+#     for i, n in enumerate(path.nodes):
+#         print(f"\n节点{i} ({n.node_type.name}):")
+#         for field in n.__dataclass_fields__:
+#             value = getattr(n, field)
+#             print(f"  {field}: {value}")
+#
+#     # 把 Probe 命中登记进网格
+#     num_hits = register_probe_hits_for_path(path, probe_grid)
+#     print(f"\n登记到探测网格的命中次数: {num_hits}")
+#     # 5) 打印每个被命中的格子
+#     for (i, j), hits in probe_grid.cells.items():
+#         print(f"cell({i},{j}): hits={len(hits)}  "
+#               f"Pmax={max(getattr(h, 'incident_peak_pressure_kpa', 0.0) for h in hits):.1f} kPa  "
+#               f"t_first={min(getattr(h, 'arrive_time_ms', 1e9) for h in hits):.2f} ms")
+#     # 由结点的参数，进行面的渲染
+#
+#     # 渲染成 Open3D LineSet（红色）
+#     lineset = raypath_to_lineset(path, color=(1, 0, 0))
+#     vis_meshes.append(lineset)
+#
+#     vis_meshes.append(make_probe_grid_lineset(probe_grid))
+#     pcd_hits = make_probe_hits_pointcloud(probe_grid, color_by="incident_peak_pressure_kpa")
+#     if len(pcd_hits.points) > 0:
+#         vis_meshes.append(pcd_hits)
+#     # 添加入场景的坐标系（长 10 米）
+#     axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=10.0, origin=(0.0,0.0,0.0))# 红色 X 轴，蓝色 Z 轴，绿色 Y 轴
+#     vis_meshes.append(axes)
+#
+#
+#     o3d.visualization.draw_geometries(vis_meshes)
+#     export_probe_hits_csv(probe_grid, "probe_hits_points.csv")
+#     export_probe_cell_stats_csv(probe_grid, "probe_hits_cells.csv")
+#     print("\n已导出: probe_hits_points.csv / probe_hits_cells.csv")
+#     pass
 
 """
 dirs       = uniform_hemisphere(N_RAYS)
