@@ -397,11 +397,49 @@ def make_probe_hits_pointcloud(grid: ProbeGrid,
     return pcd
 
 import csv
+import json
+import datetime as _dt
 
-def export_probe_hits_csv(grid: ProbeGrid, path: str) -> None:
+def _build_grid_meta(grid: ProbeGrid,
+                     *,
+                     format_name: str,
+                     extra: dict | None = None) -> dict:
+    """把 ProbeGrid 的几何与当前运行摘要打包成 JSON 友好的元数据字典。"""
+    meta = {
+        "format": format_name,              # 'probe_hits_points' 或 'probe_hits_cells'
+        "version": "1.0",
+        "exported_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "units": {                          # 统一说明单位
+            "length": "m",
+            "pressure": "kPa",
+            "time": "ms",
+            "impulse": "kPa·ms",
+        },
+        "grid": {
+            "origin": list(grid.origin),
+            "u_vec": list(grid.u_vec),
+            "v_vec": list(grid.v_vec),
+            "du": float(grid.du),
+            "dv": float(grid.dv),
+            "nu": int(grid.nu),
+            "nv": int(grid.nv),
+        },
+        "summary": {
+            "unique_hit_cells": int(len(grid.cells)),
+            "total_hits": int(sum(len(h) for h in grid.cells.values())),
+        }
+    }
+    if extra:
+        # 允许把“本次实验上下文”塞进来，比如 W=500kg, 反射次数上限, 场景名 等
+        meta["context"] = extra
+    return meta
+
+
+def export_probe_hits_csv(grid: ProbeGrid, path: str, *,
+                          run_meta: dict | None = None) -> None:
     """
     把所有 Probe 命中点逐条导出（行=一次命中）。
-    列包含：i,j, x,y,z, Ps_inc, Ps_ref, I_inc, I_ref, ta, td, beta
+    头部以注释写入 JSON 元数据：# meta= {...}
     """
     fields = [
         "i","j","x","y","z",
@@ -413,12 +451,18 @@ def export_probe_hits_csv(grid: ProbeGrid, path: str) -> None:
         "constant_time_ms",
         "friedlander_beta",
     ]
+    meta = _build_grid_meta(grid, format_name="probe_hits_points", extra=run_meta)
+
     with open(path, "w", newline="", encoding="utf-8") as f:
+        # —— 注释头（可被 pandas 用 comment='#' 忽略）——
+        f.write("# meta=" + json.dumps(meta, ensure_ascii=False) + "\n")
+        f.write("# columns=" + ",".join(fields) + "\n")
+
         w = csv.writer(f)
         w.writerow(fields)
         for (i,j), hits in grid.cells.items():
             for n in hits:
-                x,y,z = n.coord
+                x, y, z = n.coord
                 row = [
                     i, j, x, y, z,
                     getattr(n, "incident_peak_pressure_kpa", 0.0),
@@ -431,20 +475,35 @@ def export_probe_hits_csv(grid: ProbeGrid, path: str) -> None:
                 ]
                 w.writerow(row)
 
-def export_probe_cell_stats_csv(grid: ProbeGrid, path: str) -> None:
+
+def export_probe_cell_stats_csv(grid: ProbeGrid, path: str, *,
+                                run_meta: dict | None = None) -> None:
     """
     对每个格子做简单聚合：命中次数、Pmax、最早到达时间。
+    头部写 JSON 元数据与聚合口径说明。
     """
-    import csv
+    fields = ["i","j","hits","Pmax_inc_kPa","t_first_ms"]
+    meta = _build_grid_meta(grid, format_name="probe_hits_cells", extra=run_meta)
+    # 额外写清本文件的聚合口径，便于论文复现
+    meta["aggregation"] = {
+        "Pmax_inc_kPa": "max over incident_peak_pressure_kpa within cell",
+        "t_first_ms": "min over arrive_time_ms within cell",
+        "hits": "count of hits within cell"
+    }
+
     with open(path, "w", newline="", encoding="utf-8") as f:
+        f.write("# meta=" + json.dumps(meta, ensure_ascii=False) + "\n")
+        f.write("# columns=" + ",".join(fields) + "\n")
+
         w = csv.writer(f)
-        w.writerow(["i","j","hits","Pmax_inc_kPa","t_first_ms"])
+        w.writerow(fields)
         for (i,j), hits in grid.cells.items():
             if not hits:
                 continue
             pmax = max(getattr(h, "incident_peak_pressure_kpa", 0.0) for h in hits)
             tmin = min(getattr(h, "arrive_time_ms", float("inf")) for h in hits)
             w.writerow([i, j, len(hits), pmax, tmin])
+
 
 if __name__ == "__main__":
     scene, vis_meshes, material_map, probe_geom_ids, probe_grid = build_scene()
