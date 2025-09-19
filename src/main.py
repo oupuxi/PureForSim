@@ -130,7 +130,44 @@ def build_scene():
     vis_meshes.append(probe_mesh)
     probe_geom_ids.add(geom_id)
 
-    return scene,vis_meshes,material_map,probe_geom_ids,probe_grid
+    # === 在 build_scene() 之后、发射射线之前，新增一张水平探测面 ===
+    # 这张面覆盖四个角点：(-25,1.5,-25) → (25,1.5,-25) → (25,1.5,25) → (-25,1.5,25)
+    # 这里选择原点在“左下角”（x=-25,z=-25），u 沿 +x，v 沿 +z
+    origin_h = (-25.0, 10, -25.0)
+    u_vec_h = (1.0, 0.0, 0.0)  # 沿 x
+    v_vec_h = (0.0, 0.0, 1.0)  # 沿 z
+
+    # 50 m × 50 m 的面；下面示例用 10×10 个单元（格距 5 m）
+    nu_h, nv_h = 10, 10
+    du_h, dv_h = 5.0, 5.0
+
+    # 1) 构造水平探测面的 ProbeGrid
+    probe_grid_h = ProbeGrid(
+        origin=origin_h,
+        u_vec=u_vec_h,
+        v_vec=v_vec_h,
+        du=du_h,
+        dv=dv_h,
+        nu=nu_h,
+        nv=nv_h,
+    )
+
+    # 2) 生成 mesh 并加入场景（得到一个新的 geom_id）
+    probe_mesh_h = create_probe_plane(
+        origin=probe_grid_h.origin,
+        u_vec=probe_grid_h.u_vec,
+        v_vec=probe_grid_h.v_vec,
+        nu=probe_grid_h.nu,
+        nv=probe_grid_h.nv,
+        du=probe_grid_h.du,
+        dv=probe_grid_h.dv
+    )
+    geom_id_h = add_probe_plane_to_scene(scene, probe_mesh_h)
+    vis_meshes.append(probe_mesh_h)  # 可视化
+    probe_geom_ids.add(geom_id_h)  # 关键：加入“探测面几何ID集合”，这样命中此面才会生成 ProbeNode
+    print(f"已添加水平探测面(1.5m)，geom_id={geom_id_h}")
+
+    return scene,vis_meshes,material_map,probe_geom_ids,probe_grid,probe_grid_h
 
 
 
@@ -506,7 +543,7 @@ def export_probe_cell_stats_csv(grid: ProbeGrid, path: str, *,
 
 
 if __name__ == "__main__":
-    scene, vis_meshes, material_map, probe_geom_ids, probe_grid = build_scene()
+    scene, vis_meshes, material_map, probe_geom_ids, probe_grid,probe_grid_h = build_scene()
 
     origin = (0.0, 0.01, 0.0)
 
@@ -540,8 +577,11 @@ if __name__ == "__main__":
         compute_physics_for_raypath(path, 500)
 
         # 登记到探测网格
-        hit_count = register_probe_hits_for_path(path, probe_grid)
-        print(f"登记命中次数: {hit_count}")
+        hits_v = register_probe_hits_for_path(path, probe_grid)  # 旧：竖直面 (x=30)
+        hits_h = register_probe_hits_for_path(path, probe_grid_h)  # 新：水平面 (y=1.5)
+        print(f"登记命中：竖直面 {hits_v} 次；水平面 {hits_h} 次")
+
+        # print(f"登记命中次数: {hit_count}")
 
         # 打印该条射线的 Probe 命中，以及各命中格子的 (i,j)
         for n in path.nodes:
@@ -563,17 +603,25 @@ if __name__ == "__main__":
 
     # 可视化：网格线 + 命中点云（按入射峰压着色）
     vis_meshes.append(make_probe_grid_lineset(probe_grid))
-    pcd_hits = make_probe_hits_pointcloud(probe_grid, color_by="incident_peak_pressure_kpa")
-    if len(pcd_hits.points) > 0:
-        vis_meshes.append(pcd_hits)
+
+    vis_meshes.append(make_probe_grid_lineset(probe_grid_h))  # 新：水平面
+
+    pcd_hits_v = make_probe_hits_pointcloud(probe_grid, color_by="incident_peak_pressure_kpa")
+    pcd_hits_h = make_probe_hits_pointcloud(probe_grid_h, color_by="incident_peak_pressure_kpa")
+    if len(pcd_hits_v.points) > 0: vis_meshes.append(pcd_hits_v)
+    if len(pcd_hits_h.points) > 0: vis_meshes.append(pcd_hits_h)
     axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=10.0, origin=(0,0,0))
     vis_meshes.append(axes)
-    o3d.visualization.draw_geometries(vis_meshes)
+    # o3d.visualization.draw_geometries(vis_meshes)
 
     # 导出 CSV
     export_probe_hits_csv(probe_grid, "probe_hits_points.csv")
     export_probe_cell_stats_csv(probe_grid, "probe_hits_cells.csv")
     print("\n已导出: probe_hits_points.csv / probe_hits_cells.csv")
+
+    export_probe_hits_csv(probe_grid_h, "probe_hits_points_y1p5.csv")
+    export_probe_cell_stats_csv(probe_grid_h, "probe_hits_cells_y1p5.csv")
+    print("\n已导出：probe_hits_points_y1p5.csv / probe_hits_cells_y1p5.csv（水平面）")
 
 # if __name__ == "__main__":
 #     scene, vis_meshes,material_map,probe_geom_ids,probe_grid= build_scene()
