@@ -1,0 +1,1 @@
+# 分块（chunk）调用你已有 trace_single_ray，产出 RayPath 列表/生成器。

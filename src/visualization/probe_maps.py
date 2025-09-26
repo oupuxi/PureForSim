@@ -353,7 +353,7 @@ def export_field_csv(field: Field2D, path: str) -> None:
                 writer.writerow([i, j, float(v)])
 
 if __name__ == "__main__":
-    points_csv = r"D:\Project\py_costom\pureForSim\src\probe_hits_points.csv"
+    points_csv = r"D:\Project\py_costom\pureForSim\src\probe_hits_points_y10.csv"
 
     F_peak = peak_map_from_points(points_csv, which="incident")
     F_arr = arrival_map_from_points(points_csv)
