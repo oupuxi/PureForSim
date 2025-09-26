@@ -1,1 +1,0 @@
-# 按选定“发射模式”批量生成 origins[N], dirs[N], ray_weight[N]。
