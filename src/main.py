@@ -510,14 +510,14 @@ if __name__ == "__main__":
     print(f"命中过的格子数 = {len(probe_grid_h.cells)} / 总格子 {probe_grid_h.nu * probe_grid_h.nv}")
     print(f"有效路径数（至少命中一次水平面）= {total_paths}，累计登记命中次数 = {total_hits_h}")
 
-    # # （可选）可视化：网格线 + 命中点云（按入射峰压着色）
-    # vis_meshes.append(make_probe_grid_lineset(probe_grid_h))
-    # pcd_hits_h = make_probe_hits_pointcloud(probe_grid_h, color_by="incident_peak_pressure_kpa")
-    # if len(pcd_hits_h.points) > 0:
-    #     vis_meshes.append(pcd_hits_h)
-    # axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=10.0, origin=(0,0,0))
-    # vis_meshes.append(axes)
-    # o3d.visualization.draw_geometries(vis_meshes)  # 大量射线时先注掉避免卡顿
+    # （可选）可视化：网格线 + 命中点云（按入射峰压着色）
+    vis_meshes.append(make_probe_grid_lineset(probe_grid_h))
+    pcd_hits_h = make_probe_hits_pointcloud(probe_grid_h, color_by="incident_peak_pressure_kpa")
+    if len(pcd_hits_h.points) > 0:
+        vis_meshes.append(pcd_hits_h)
+    axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=10.0, origin=(0,0,0))
+    vis_meshes.append(axes)
+    o3d.visualization.draw_geometries(vis_meshes)  # 大量射线时先注掉避免卡顿
 
     # # 导出 CSV（只导出“水平面”）
     # run_meta = {
