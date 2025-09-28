@@ -110,27 +110,6 @@ def build_scene():
         geom_id =scene.add_triangles(tmesh_house)
         material_map[geom_id] = mat
 
-    # 探测面
-    probe_grid = ProbeGrid(
-        origin = (30.0, 0.0, -24.0),  # z 从 -24 到 +24，总宽 48m
-        u_vec   = (0.0, 0.0, 1.0),
-        v_vec   = (0.0, 1.0, 0.0),
-        du      = 6.0,   # 48m / 8 = 6m
-        dv      = 5.0,   # 40m / 8 = 5m
-        nu      = 9,     # 列数不变
-        nv      = 9,     # 行数不变
-    )
-    probe_mesh = create_probe_plane(
-        origin=probe_grid.origin,
-        u_vec=probe_grid.u_vec,
-        v_vec=probe_grid.v_vec,
-        nu=probe_grid.nu,
-        nv=probe_grid.nv,
-        du=probe_grid.du,
-        dv=probe_grid.dv)
-    geom_id = add_probe_plane_to_scene(scene, probe_mesh)
-    vis_meshes.append(probe_mesh)
-    probe_geom_ids.add(geom_id)
 
     # === 在 build_scene() 之后、发射射线之前，新增一张水平探测面 ===
     # 这张面覆盖四个角点：(-25,1.5,-25) → (25,1.5,-25) → (25,1.5,25) → (-25,1.5,25)
@@ -169,7 +148,7 @@ def build_scene():
     probe_geom_ids.add(geom_id_h)  # 关键：加入“探测面几何ID集合”，这样命中此面才会生成 ProbeNode
     print(f"已添加水平探测面(10m)，geom_id={geom_id_h}")
 
-    return scene,vis_meshes,material_map,probe_geom_ids,probe_grid,probe_grid_h
+    return scene,vis_meshes,material_map,probe_geom_ids,probe_grid_h
 
 
 
@@ -435,15 +414,6 @@ def make_probe_hits_pointcloud(grid: ProbeGrid,
     pcd.colors = o3d.utility.Vector3dVector(colors)
     return pcd
 
-import csv
-import json
-import datetime as _dt
-
-
-
-
-
-
 def has_hit_on_grid(path: RayPath, grid: ProbeGrid) -> bool:
     """路径中是否至少有一个 ProbeNode 落在 grid 的格子里"""
     for n in path.nodes:
@@ -454,7 +424,7 @@ def has_hit_on_grid(path: RayPath, grid: ProbeGrid) -> bool:
 
 if __name__ == "__main__":
     # 场景：仍然创建竖直面 + 水平面，但下面只使用水平面
-    scene, vis_meshes, material_map, probe_geom_ids, probe_grid, probe_grid_h = build_scene()
+    scene, vis_meshes, material_map, probe_geom_ids, probe_grid_h = build_scene()
 
     # ========= 只发射“面向 +Y”半球的射线（针对水平面） =========
     np.random.seed(42)             # 可复现实验
@@ -519,95 +489,21 @@ if __name__ == "__main__":
     vis_meshes.append(axes)
     o3d.visualization.draw_geometries(vis_meshes)  # 大量射线时先注掉避免卡顿
 
-    # # 导出 CSV（只导出“水平面”）
-    # run_meta = {
-    #     "charge_kg_tnt": CHARGE_KG_TNT,
-    #     "n_rays_horizontal": int(N_H),
-    #     "min_cos_to_normal": float(min_cos_to_normal),
-    #     "hemisphere": "+Y (horizontal plane focus)",
-    #     "note": "only upward hemisphere rays; grazing filtered with dot(y)>=threshold"
-    # }
-    # export_probe_hits_csv(probe_grid_h,      "probe_hits_points_y10.csv",  run_meta=run_meta)
-    # export_probe_cell_stats_csv(probe_grid_h, "probe_hits_cells_y10.csv",   run_meta=run_meta)
-    # print("\n已导出：probe_hits_points_y10.csv / probe_hits_cells_y10.csv（仅水平面）")
+    # 导出 CSV（只导出“水平面”）
+    run_meta = {
+        "charge_kg_tnt": CHARGE_KG_TNT,
+        "n_rays_horizontal": int(N_H),
+        "min_cos_to_normal": float(min_cos_to_normal),
+        "hemisphere": "+Y (horizontal plane focus)",
+        "note": "only upward hemisphere rays; grazing filtered with dot(y)>=threshold"
+    }
+    export_probe_hits_csv(probe_grid_h,      "probe_hits_points_y10.csv",  run_meta=run_meta)
+    export_probe_cell_stats_csv(probe_grid_h, "probe_hits_cells_y10.csv",   run_meta=run_meta)
+    print("\n已导出：probe_hits_points_y10.csv / probe_hits_cells_y10.csv（仅水平面）")
 
 
-    # # ───────────────────────────────────────
-    # # 7 条测试方向：
-    # # 3 条打到同一格 (i=4, j=4)；4 条打到左右下上的邻格
-    # # ───────────────────────────────────────
-    # d_same_1 = np.array([0.797, 0.598,  0.0797])   # 命中 (4,4)
-    # d_same_2 = np.array([0.815, 0.570,  0.1085])   # 命中 (4,4)
-    # d_same_3 = np.array([0.774, 0.632,  0.0258])   # 命中 (4,4)
-    #
-    # d_left   = np.array([0.797, 0.598, -0.0797])   # 命中 (3,4)
-    # d_right  = np.array([0.778, 0.583,  0.2330])   # 命中 (5,4)
-    # d_down   = np.array([0.861, 0.502,  0.0860])   # 命中 (4,3)
-    # d_up     = np.array([0.735, 0.674,  0.0736])   # 命中 (4,5)
-    #
-    # test_dirs = [d_same_1, d_same_2, d_same_3, d_left, d_right, d_down, d_up]
-    #
-    # # 逐条发射、计算物理量、登记到 ProbeGrid
-    # for k, d in enumerate(test_dirs, 1):
-    #     print(f"\n=== 发射射线 #{k} ===")
-    #     path = trace_single_ray(
-    #         scene=scene,
-    #         origin=origin,
-    #         dir=d,                         # 直接使用上面的单位方向
-    #         material_map=material_map,
-    #         probe_geom_ids=probe_geom_ids,
-    #         max_bounces=3
-    #     )
-    #     # 计算该条射线上的 Ps/td/β/ta/冲量等
-    #     compute_physics_for_raypath(path, 500)
-    #
-    #     # 登记到探测网格
-    #     hits_v = register_probe_hits_for_path(path, probe_grid)  # 旧：竖直面 (x=30)
-    #     hits_h = register_probe_hits_for_path(path, probe_grid_h)  # 新：水平面 (y=1.5)
-    #     print(f"登记命中：竖直面 {hits_v} 次；水平面 {hits_h} 次")
-    #
-    #     # print(f"登记命中次数: {hit_count}")
-    #
-    #     # 打印该条射线的 Probe 命中，以及各命中格子的 (i,j)
-    #     for n in path.nodes:
-    #         if isinstance(n, ProbeNode):
-    #             idx = probe_grid.coord_to_index(n.coord)
-    #             print(f"  Probe 命中坐标 {n.coord} → cell{idx}  "
-    #                   f"Ps={getattr(n,'incident_peak_pressure_kpa',0.0):.1f} kPa, "
-    #                   f"ta={getattr(n,'arrive_time_ms',0.0):.2f} ms")
-    #
-    #     # 可选：把单条路径的折线也加到可视化里
-    #     vis_meshes.append(raypath_to_lineset(path, color=(1, 0, 0)))
-    #
-    # # 汇总打印每个被命中的格子的统计
-    # print("\n【探测网格命中汇总】")
-    # for (i, j), hits in probe_grid.cells.items():
-    #     pmax = max(getattr(h, "incident_peak_pressure_kpa", 0.0) for h in hits)
-    #     tmin = min(getattr(h, "arrive_time_ms", 1e9) for h in hits)
-    #     print(f"  cell({i},{j}): hits={len(hits)}  Pmax={pmax:.1f} kPa  t_first={tmin:.2f} ms")
-    #
-    # # 可视化：网格线 + 命中点云（按入射峰压着色）
-    # vis_meshes.append(make_probe_grid_lineset(probe_grid))
-    #
-    # vis_meshes.append(make_probe_grid_lineset(probe_grid_h))  # 新：水平面
-    #
-    # pcd_hits_v = make_probe_hits_pointcloud(probe_grid, color_by="incident_peak_pressure_kpa")
-    # pcd_hits_h = make_probe_hits_pointcloud(probe_grid_h, color_by="incident_peak_pressure_kpa")
-    # if len(pcd_hits_v.points) > 0: vis_meshes.append(pcd_hits_v)
-    # if len(pcd_hits_h.points) > 0: vis_meshes.append(pcd_hits_h)
-    # axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=10.0, origin=(0,0,0))
-    # vis_meshes.append(axes)
-    # # o3d.visualization.draw_geometries(vis_meshes)
-    #
-    # # 导出 CSV
-    # export_probe_hits_csv(probe_grid, "probe_hits_points.csv")
-    # export_probe_cell_stats_csv(probe_grid, "probe_hits_cells.csv")
-    # print("\n已导出: probe_hits_points.csv / probe_hits_cells.csv")
-    #
-    # export_probe_hits_csv(probe_grid_h, "probe_hits_points_y1p5.csv")
-    # export_probe_cell_stats_csv(probe_grid_h, "probe_hits_cells_y1p5.csv")
-    # print("\n已导出：probe_hits_points_y1p5.csv / probe_hits_cells_y1p5.csv（水平面）")
 
 
-ddd
+
+
 
