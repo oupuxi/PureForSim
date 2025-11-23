@@ -1,0 +1,11 @@
+# meta={"format": "probe_hits_cells", "version": "1.0", "exported_at": "2025-09-19T15:10:16", "units": {"length": "m", "pressure": "kPa", "time": "ms", "impulse": "kPa·ms"}, "grid": {"origin": [30.0, 0.0, -24.0], "u_vec": [0.0, 0.0, 1.0], "v_vec": [0.0, 1.0, 0.0], "du": 6.0, "dv": 5.0, "nu": 9, "nv": 9}, "summary": {"unique_hit_cells": 8, "total_hits": 14}, "aggregation": {"Pmax_inc_kPa": "max over incident_peak_pressure_kpa within cell", "t_first_ms": "min over arrive_time_ms within cell", "hits": "count of hits within cell"}}
+# columns=i,j,hits,Pmax_inc_kPa,t_first_ms
+i,j,hits,Pmax_inc_kPa,t_first_ms
+4,1,4,335.0480934876125,11.745358019987586
+4,4,3,107.488208212288,67.21653790677595
+3,1,1,254.33462943192254,14.685093086754327
+3,4,1,103.87772737031904,70.15110000110298
+4,2,2,239.8629884827348,15.401643861309516
+5,4,1,98.10941263114181,72.17271140719262
+4,3,1,92.21992963467115,59.94430865594629
+4,5,1,109.68553431443897,80.64007348418325
