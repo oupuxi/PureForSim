@@ -16,6 +16,11 @@ from typing import Dict, Tuple, List, Optional, Iterable
 import io, csv, re, ast, math
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.colors import Normalize, ListedColormap
+from matplotlib.patches import Rectangle
+import matplotlib.patheffects as pe
+import numpy as np
 
 # ---------- 数据结构 ----------
 Vec3 = Tuple[float, float, float]
@@ -299,27 +304,259 @@ def snapshot_map(points_csv: str, t_ms: float,
         _assign_cell(arr, i, j, v)
     return Field2D(arr, meta, f"snapshot_{which}_t{t_ms:.1f}ms", "kPa")
 
+
+def _building_mask_from_meta(meta) -> Optional[np.ndarray]:
+    """
+    兼容 export.py 的写法：house_centers/house_size 在 meta['context'] 里
+    （见 export.py: meta["context"]=run_meta）
+    """
+    # meta.extra 里通常就是 meta json 的顶层 dict
+    top = getattr(meta, "extra", {}) or {}
+
+    # 关键：先从 context 里找（export.py 把 run_meta 塞进这里）
+    ctx = top.get("context", {}) or {}
+
+    def pick(key: str):
+        # 先从 context 拿，再从顶层拿（两者都兼容）
+        if key in ctx: return ctx[key]
+        if key in top: return top[key]
+        # 再做大小写容错
+        for k, v in ctx.items():
+            if str(k).lower() == key.lower():
+                return v
+        for k, v in top.items():
+            if str(k).lower() == key.lower():
+                return v
+        return None
+
+    centers = pick("house_centers")
+    size    = pick("house_size")
+    if centers is None or size is None:
+        return None
+
+    # CSV 读出来可能是字符串，转成 python 对象
+    if isinstance(centers, str):
+        centers = ast.literal_eval(centers)
+    if isinstance(size, str):
+        size = float(ast.literal_eval(size))
+
+    try:
+        centers = list(centers)
+        size = float(size)
+    except Exception:
+        return None
+
+    ox, _, oz = meta.origin
+    du, dv = meta.du, meta.dv
+    nu, nv = meta.nu, meta.nv
+
+    uu = (np.arange(nu) + 0.5) * du
+    vv = (np.arange(nv) + 0.5) * dv
+    U, V = np.meshgrid(uu, vv)
+
+    mask = np.zeros((nv, nu), dtype=bool)
+    half = 0.5 * size
+
+    for (cx, cz) in centers:
+        u0 = (cx - half) - ox
+        u1 = (cx + half) - ox
+        v0 = (cz - half) - oz
+        v1 = (cz + half) - oz
+        mask |= (U >= u0) & (U <= u1) & (V >= v0) & (V <= v1)
+
+    return mask
+
+
 # ---------- 可视化和导出 ----------
-def plot_field(field: Field2D, *, cmap: str = "viridis",
-               vmin: float | None = None, vmax: float | None = None,
-               title: str | None = None, save_path: str | None = None):
+# --- add these imports near the top of probe_maps.py ---
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize, ListedColormap
+from matplotlib.patches import Rectangle
+import matplotlib.patheffects as pe
+from typing import Optional
+
+# 如果你文件里已经有 GridMeta / Field2D 的定义或 import，就不需要重复
+# from .your_structs import GridMeta, Field2D
+
+
+
+
+def plot_field(
+    field,
+    *,
+    title: str | None = None,
+    save_path: str | None = None,
+    cbar_label: str | None = None,
+    show_buildings: bool = True,
+    vmax_clip: float = 300.0,                    # 你要 >300 变白
+    zero_color_rgba=(1.0, 0.97, 0.80, 1.0),      # 你要 0 是淡黄
+    nodata_to_zero: bool = True,                 # 非建筑 NaN -> 0
+):
+    """
+    规则（按你的要求）：
+    1) 建筑（house mask）= 白色（不画黑边）
+    2) 超压 > vmax_clip = 白色
+    3) 非建筑且无数据/无命中（NaN）= 当作 0，上色为淡黄（不是白/灰）
+    4) 色带使用 magma_r，且 0 的颜色强制为淡黄
+    """
     meta = field.meta
-    extent = [0, meta.nu * meta.du, 0, meta.nv * meta.dv]  # 物理坐标轴刻度（米）
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(field.data, origin="lower", interpolation="nearest",
-                   extent=extent, cmap=cmap, vmin=vmin, vmax=vmax)
-    ax.set_xlabel("u (m)")
-    ax.set_ylabel("v (m)")
+    extent = [0, meta.nu * meta.du, 0, meta.nv * meta.dv]
+
+    fig, ax = plt.subplots(figsize=(6.6, 5.4))
+    ax.set_facecolor("white")
+
+    # --- colormap: magma_r + 0=淡黄 + over=白 ---
+    base = plt.get_cmap("magma_r")
+    colors = base(np.linspace(0, 1, 256))
+    colors[0] = np.array(zero_color_rgba)  # 0 -> 淡黄
+
+    cmap_obj = ListedColormap(colors)
+    cmap_obj.set_over("white")             # >vmax_clip -> 白
+    # set_bad 仍可设置，但我们会把非建筑 NaN -> 0，所以 bad 基本不会出现
+    cmap_obj.set_bad(colors[0])            # 万一还有 NaN，也按淡黄处理
+
+    norm = Normalize(vmin=0.0, vmax=float(vmax_clip), clip=False)
+
+    # --- data prep ---
+    data = field.data.astype(float).copy()
+
+    bmask = None
+    # --- buildings overlay: solid white RGBA, NO outline ---
+    if show_buildings:
+        bmask = _building_mask_from_meta(meta)
+        if bmask is not None and np.any(bmask):
+            rgba = np.zeros((bmask.shape[0], bmask.shape[1], 4), dtype=float)
+            rgba[..., 0:3] = 1.0  # RGB=白
+            rgba[..., 3] = 0.0  # 默认透明
+            rgba[bmask, 3] = 1.0  # 建筑区域不透明
+
+            ax.imshow(
+                rgba,
+                origin="lower",
+                interpolation="nearest",
+                extent=extent,
+                zorder=100
+            )
+
+    bmask = _building_mask_from_meta(meta)
+    print("bmask sum:", 0 if bmask is None else int(bmask.sum()))
+
+    # 非建筑 NaN -> 0（让它显示成淡黄）
+    if nodata_to_zero:
+        if bmask is None:
+            data[np.isnan(data)] = 0.0
+        else:
+            data[(~bmask) & np.isnan(data)] = 0.0
+            # 建筑区域即便是 NaN 无所谓（后面会用白色 overlay 盖掉）
+            # 如果你想更干净，也可以：data[bmask & np.isnan(data)] = 0.0
+
+    # --- main heatmap ---
+    im = ax.imshow(
+        data,
+        origin="lower",
+        interpolation="nearest",
+        extent=extent,
+        cmap=cmap_obj,
+        norm=norm
+    )
+
+    # 保持几何比例不变（圆不会变椭圆）
+    ax.set_aspect("equal", adjustable="box")
+
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
     if title:
         ax.set_title(title)
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label(field.units or "")
+
+    # --- buildings overlay: white, NO outline ---
+    # --- buildings overlay: solid white RGBA, NO outline ---
+    if show_buildings and bmask is not None and np.any(bmask):
+        rgba = np.zeros((bmask.shape[0], bmask.shape[1], 4), dtype=float)
+        rgba[..., :] = (1.0, 1.0, 1.0, 1.0)  # 纯白不透明
+        rgba[~bmask, 3] = 0.0  # 非建筑区域全透明
+
+        ax.imshow(
+            rgba,
+            origin="lower",
+            interpolation="nearest",
+            extent=extent,
+            zorder=10
+        )
+
+        # 不画 contour / 不画黑边（按你的要求）
+
+    # --- colorbar with extend max ---
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, extend="max")
+    cbar.set_label(cbar_label if cbar_label else (field.units or ""))
+
     fig.tight_layout()
     if save_path:
-        fig.savefig(save_path, dpi=200)
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
     else:
         plt.show()
+def plot_field_basic(
+    field,
+    *,
+    title: str | None = None,
+    save_path: str | None = None,
+    cbar_label: str | None = None,
+    cmap: str = "magma_r",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    show_buildings: bool = True,
+):
+    meta = field.meta
+    extent = [0, meta.nu * meta.du, 0, meta.nv * meta.dv]
+
+    fig, ax = plt.subplots(figsize=(6.6, 5.4))
+    ax.set_facecolor("white")
+
+    # 普通色标：NaN 显示浅灰，不做“NaN->0”，不做 “>vmax 白”
+    cmap_obj = plt.get_cmap(cmap).copy()
+    cmap_obj.set_bad("#F0F0F0")
+
+    data = field.data.astype(float)
+
+    im = ax.imshow(
+        data,
+        origin="lower",
+        interpolation="nearest",
+        extent=extent,
+        cmap=cmap_obj,
+        vmin=vmin,
+        vmax=vmax,
+    )
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    if title:
+        ax.set_title(title)
+
+    # 建筑仍然可选盖白（不画边框）
+    if show_buildings:
+        bmask = _building_mask_from_meta(meta)
+        if bmask is not None and np.any(bmask):
+            rgba = np.zeros((bmask.shape[0], bmask.shape[1], 4), dtype=float)
+            rgba[..., 0:3] = 1.0
+            rgba[..., 3] = 0.0
+            rgba[bmask, 3] = 1.0
+            ax.imshow(rgba, origin="lower", interpolation="nearest", extent=extent, zorder=100)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(cbar_label if cbar_label else (field.units or ""))
+
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+
 
 def export_field_csv(field: Field2D, path: str) -> None:
     """
@@ -360,10 +597,27 @@ if __name__ == "__main__":
     F_imp = impulse_map_from_points(points_csv, which="incident", weight_col=None)
     F_hit = hitcount_map_from_points(points_csv)
 
-    plot_field(F_peak, title="Peak Overpressure (incident)", save_path="peak_incident.png")
-    plot_field(F_arr, title="Earliest Arrival Time", save_path="arrival_min.png")
-    plot_field(F_imp, title="Impulse Sum (incident)", save_path="impulse_sum.png")
-    plot_field(F_hit, title="Hit Count", save_path="hit_count.png")
+    # 峰值超压：继续用你现在的 plot_field（专用规则）
+    plot_field(
+        F_peak,
+        title="Peak Overpressure (incident)",
+        cbar_label="kPa",
+        save_path="peak_incident.png",
+        vmax_clip=300.0
+    )
+
+    # 到达时间 / 冲量 / 命中数：用普通版
+    vmax_arr = np.nanpercentile(F_arr.data, 99)
+    plot_field_basic(F_arr, title="Earliest Arrival Time",
+                     cbar_label="ms", vmin=0, vmax=vmax_arr, save_path="arrival_min.png")
+
+    vmax_imp = np.nanpercentile(F_imp.data, 99)
+    plot_field_basic(F_imp, title="Impulse Sum (incident)",
+                     cbar_label="(unit)", vmin=0, vmax=vmax_imp, save_path="impulse_sum.png")
+
+    vmax_hit = np.nanpercentile(F_hit.data, 99)
+    plot_field_basic(F_hit, title="Hit Count",
+                     cbar_label="count", vmin=0, vmax=vmax_hit, save_path="hit_count.png")
 
     # 快照：取全时段中值
     t0, t1 = time_range_from_points(points_csv)

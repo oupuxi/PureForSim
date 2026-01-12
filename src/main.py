@@ -432,7 +432,7 @@ if __name__ == "__main__":
     ORIGIN = (0.0, 0.01, 0.0)
     CHARGE_KG_TNT = 500
 
-    N_H = 20000        # 先从 2万条开始，流程稳定后再加大
+    N_H = 200000        # 先从 2万条开始，流程稳定后再加大
     min_cos_to_normal = 0.08  # 掠射剔除阈值：与水平面法线的夹角不能太接近90°
 
     # 生成 +Y 半球方向
@@ -496,7 +496,9 @@ if __name__ == "__main__":
         "n_rays_horizontal": int(N_H),
         "min_cos_to_normal": float(min_cos_to_normal),
         "hemisphere": "+Y (horizontal plane focus)",
-        "note": "only upward hemisphere rays; grazing filtered with dot(y)>=threshold"
+        "note": "only upward hemisphere rays; grazing filtered with dot(y)>=threshold",
+        "house_centers": HOUSE_CENTERS,
+        "house_size": HOUSE_SIZE,
     }
     export_probe_hits_csv(probe_grid_h,      "probe_hits_points_y10.csv",  run_meta=run_meta)
     export_probe_cell_stats_csv(probe_grid_h, "probe_hits_cells_y10.csv",   run_meta=run_meta)
